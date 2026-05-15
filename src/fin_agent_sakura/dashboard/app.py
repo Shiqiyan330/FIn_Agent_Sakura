@@ -34,6 +34,12 @@ from fin_agent_sakura.applications.backtest_service import (
     run_a_share_backtest,
     save_backtest_news_csv,
 )
+from fin_agent_sakura.applications.background_advisor import (
+    BackgroundAdvisorTask,
+    is_background_task_active,
+    load_latest_background_advisor_task,
+    submit_background_advisor_turn,
+)
 from fin_agent_sakura.applications.china_investment_assistant import (
     ChinaInvestmentAssistant,
     ChinaInvestmentResult,
@@ -46,7 +52,6 @@ from fin_agent_sakura.applications.client_profile import (
 )
 from fin_agent_sakura.applications.conversational_advisor import (
     ConversationalAdvisorSession,
-    continue_conversational_advisor_session,
     load_latest_conversational_advisor_session,
     start_conversational_advisor_session,
 )
@@ -369,41 +374,27 @@ def _render_conversational_advisor_page() -> None:
         session = start_conversational_advisor_session(market="cn", user=account)
 
     _render_advisor_chat(session)
+    background_task = load_latest_background_advisor_task(account.user_id)
+    if background_task is not None and background_task.session_id == session.session_id:
+        _render_background_advisor_task(background_task)
     if session.agent_events:
         _render_agent_call_trace(session.agent_events, expanded=False)
-    user_message = st.chat_input("输入你的投资目标、股票选择或追问...")
+
+    active_task = is_background_task_active(background_task) and background_task.session_id == session.session_id
+    user_message = st.chat_input("输入你的投资目标、股票选择或追问...", disabled=active_task)
     if user_message:
         with st.chat_message("user"):
             st.markdown(user_message)
-        with st.chat_message("assistant"):
-            placeholder = st.empty()
-            trace_box = st.empty()
-            progress_events: list[Any] = []
-
-            def on_agent_event(event: Any) -> None:
-                _append_live_agent_event(progress_events, event)
-                with trace_box.container():
-                    _render_live_agent_trace(progress_events)
-
-            try:
-                _stream_advisor_progress(placeholder, session.stage)
-                session = continue_conversational_advisor_session(
-                    session,
-                    user_message,
-                    use_llm=True,
-                    progress_callback=on_agent_event,
-                )
-            except Exception as exc:
-                placeholder.error(_friendly_error(exc))
-                return
-            placeholder.markdown(session.messages[-1].content)
-            with trace_box.container():
-                _render_agent_call_trace(session.agent_events, expanded=True)
+        if active_task:
+            st.warning("已有一条对话正在后台运行，请等待完成或超时后再发送下一条。")
+        else:
+            task = submit_background_advisor_turn(session, user_message, use_llm=True, timeout_seconds=20 * 60)
+            st.session_state["advisor_background_task_id"] = task.task_id
+            st.toast("已提交后台对话任务。你可以离开页面，稍后回来查看结果。")
         st.rerun()
 
     if session.artifacts:
         _render_conversation_artifacts(session.artifacts)
-
 
 def _render_local_account_center() -> LocalUserAccount:
     accounts = list_user_accounts()
@@ -448,6 +439,28 @@ def _render_advisor_chat(session: ConversationalAdvisorSession) -> None:
     for message in session.messages[-20:]:
         with st.chat_message(message.role):
             st.markdown(message.content)
+
+
+def _render_background_advisor_task(task: BackgroundAdvisorTask) -> None:
+    status_label = {
+        "pending": "等待中",
+        "running": "后台运行中",
+        "success": "已完成",
+        "failed": "失败",
+        "timed_out": "已超时",
+    }.get(task.status, task.status)
+    if task.status in {"pending", "running"}:
+        st.info(f"对话正在后台进行：{status_label}。你可以离开页面，回来后会继续显示进度；20 分钟未完成会自动标记超时。")
+        if task.events:
+            _render_live_agent_trace(task.events)
+        time.sleep(1.0)
+        st.rerun()
+    elif task.status == "success":
+        st.success("后台对话已完成，结果已保存到本地对话记录。")
+    elif task.status == "timed_out":
+        st.warning(task.error or "后台对话任务已超过 20 分钟并标记超时。")
+    elif task.status == "failed":
+        st.error(task.error or "后台对话任务失败。")
 
 
 def _append_live_agent_event(events: list[Any], event: Any) -> None:

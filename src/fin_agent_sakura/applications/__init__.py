@@ -18,6 +18,13 @@ from fin_agent_sakura.applications.backtest_service import (
     run_a_share_backtest,
     save_backtest_news_csv,
 )
+from fin_agent_sakura.applications.background_advisor import (
+    BackgroundAdvisorTask,
+    is_background_task_active,
+    load_background_advisor_task,
+    load_latest_background_advisor_task,
+    submit_background_advisor_turn,
+)
 from fin_agent_sakura.applications.china_investment_assistant import (
     ChinaInvestmentAssistant,
     ChinaInvestmentResult,
@@ -111,6 +118,7 @@ __all__ = [
     "AShareUniverseItem",
     "AShareUniverseResult",
     "BacktestRunReport",
+    "BackgroundAdvisorTask",
     "ChinaInvestmentAssistant",
     "ChinaInvestmentResult",
     "ClientProfileResult",
@@ -138,10 +146,13 @@ __all__ = [
     "append_rebalance_analysis_events",
     "build_a_share_universe",
     "get_or_create_active_user",
+    "is_background_task_active",
     "load_latest_a_share_universe",
     "load_latest_data_source_health_report",
     "load_daily_monitor_schedule",
     "load_latest_backtest_report",
+    "load_background_advisor_task",
+    "load_latest_background_advisor_task",
     "load_latest_client_profile",
     "load_latest_conversational_advisor_session",
     "load_latest_daily_monitor_result",
@@ -173,6 +184,7 @@ __all__ = [
     "save_user_account",
     "save_uploaded_report",
     "set_active_user",
+    "submit_background_advisor_turn",
     "start_conversational_advisor_session",
     "continue_conversational_advisor_session",
     "user_data_dir",
