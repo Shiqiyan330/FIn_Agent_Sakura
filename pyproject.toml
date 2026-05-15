@@ -9,6 +9,21 @@ description = "A multi-agent robo-advisor research and implementation workspace.
 requires-python = ">=3.11"
 dependencies = [
     "pandas>=2.0",
+    "plotly>=5.0",
+    "streamlit>=1.30",
+    "reportlab>=4.0",
+    "requests>=2.31",
+    "openai>=1.0",
+    "pydantic>=2",
+    "langchain-core>=0.2",
+    "langchain-openai>=0.1",
+    "langgraph>=0.2",
+    "akshare>=1.14",
+    "tushare>=1.4",
+    "yfinance>=0.2",
+    "PyPortfolioOpt>=1.5",
+    "rank-bm25>=0.2",
+    "pypdf>=4.0",
 ]
 
 [project.optional-dependencies]
