@@ -12,9 +12,6 @@ from typing import Any, Literal
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
-
-from fin_agent_sakura.agents import PERSONA_PROMPT_REGISTRY
-from fin_agent_sakura.agents.personas import ValueInvestorAnalysis
 from fin_agent_sakura.applications.agent_analysis import (
     AgentAnalysisResult,
     AgentNodeEvent,
@@ -1261,6 +1258,11 @@ def _render_search_agent_result(result: SearchAgentResult) -> None:
 def _render_persona_page() -> None:
     st.subheader("智能体 Persona")
     st.write("这里展示多智能体系统的系统提示词版本、职责边界和结构化输出要求，便于检查模型行为。")
+    try:
+        from fin_agent_sakura.agents.personas import PERSONA_PROMPT_REGISTRY, ValueInvestorAnalysis
+    except Exception as exc:
+        st.error(f"Persona 模块暂不可用：{_friendly_error(exc)}")
+        return
     rows = [
         {
             "智能体": name,
