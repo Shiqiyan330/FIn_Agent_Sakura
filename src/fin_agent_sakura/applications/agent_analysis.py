@@ -12,6 +12,7 @@ from typing import Any, Literal
 
 import pandas as pd
 
+from fin_agent_sakura.agents import build_investment_workflow, build_value_investor_chain, create_initial_state
 from fin_agent_sakura.config import get_llm_config
 from fin_agent_sakura.data import MarketDataClientFactory, TechnicalIndicators
 from fin_agent_sakura.rag.financial_context import FinancialRAGError, retrieve_financial_context
@@ -85,8 +86,6 @@ class SingleTickerAgentAnalysisRunner:
         self.output_dir = Path(output_dir)
 
     def run(self, *, ticker: str, market: MarketName = "cn", use_llm: bool = True) -> AgentAnalysisResult:
-        from fin_agent_sakura.agents import build_investment_workflow, create_initial_state
-
         graph = build_investment_workflow(
             fundamental_node=self.fundamental_node,
             sentiment_node=self.sentiment_node,
@@ -363,8 +362,6 @@ def _deterministic_fundamental_analysis(
 
 
 def _llm_value_analysis(ticker: str, financial_json: dict[str, Any], context: list[str]) -> dict[str, Any]:
-    from fin_agent_sakura.agents import build_value_investor_chain
-
     try:
         from langchain_openai import ChatOpenAI
     except ImportError as exc:

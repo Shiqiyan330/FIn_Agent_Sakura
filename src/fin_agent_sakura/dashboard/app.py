@@ -4,10 +4,15 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
+
+PROJECT_SRC = Path(__file__).resolve().parents[2]
+if str(PROJECT_SRC) not in sys.path:
+    sys.path.insert(0, str(PROJECT_SRC))
 
 import pandas as pd
 import plotly.graph_objects as go
