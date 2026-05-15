@@ -14,7 +14,14 @@ import pandas as pd
 from fin_agent_sakura.config import get_llm_config
 from fin_agent_sakura.data import MarketDataClientFactory, TechnicalIndicators
 from fin_agent_sakura.monitoring import RebalanceEvent, SentimentSignal, TechnicalSignal, TimingRuleEngine
-from fin_agent_sakura.portfolio import parse_client_constraints_from_text
+from fin_agent_sakura.portfolio import (
+    ClientPortfolioConstraints,
+    build_absolute_views_from_llm,
+    build_black_litterman_model_with_idzorek,
+    build_market_equilibrium_prior_async,
+    optimize_bl_portfolio_weights,
+    parse_client_constraints_from_text,
+)
 from fin_agent_sakura.applications.rebalance_log import append_rebalance_analysis_events
 from fin_agent_sakura.applications.risk_gate import evaluate_paper_orders_risk
 from fin_agent_sakura.storage import PositionMemory
@@ -41,6 +48,9 @@ class ChinaInvestmentResult:
     risk_gate: dict[str, Any] | None
     research_report_html: str
     warnings: list[str]
+    portfolio_engine: str = "black_litterman"
+    portfolio_diagnostics: list[str] | None = None
+    black_litterman_summary: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -56,6 +66,9 @@ class ChinaInvestmentResult:
             "risk_gate": self.risk_gate,
             "research_report_html": self.research_report_html,
             "warnings": self.warnings,
+            "portfolio_engine": self.portfolio_engine,
+            "portfolio_diagnostics": self.portfolio_diagnostics or [],
+            "black_litterman_summary": self.black_litterman_summary or {},
         }
 
 
@@ -80,10 +93,30 @@ class ChinaInvestmentAssistant:
         candidate_universe = (universe or _default_a_share_universe())[:max_candidates]
         market_rows = await self._score_universe(candidate_universe, warnings)
         mode = "live_data" if not warnings else "offline_fallback"
+        selected_count = min(max(selected_count, 5), len(market_rows))
         selected = market_rows.head(selected_count).reset_index(drop=True)
 
         constraints = parse_client_constraints_from_text(profile_text)
-        target_weights = _build_target_weights(selected, constraints.max_single_asset_weight)
+        portfolio_engine = "black_litterman"
+        black_litterman_summary: dict[str, Any] = {}
+        try:
+            target_weights, black_litterman_summary = await _build_black_litterman_target_weights(
+                selected,
+                constraints,
+                warnings,
+            )
+        except Exception as exc:
+            portfolio_engine = "score_fallback_after_black_litterman_failure"
+            warnings.append(
+                "Black-Litterman完整链路未能完成，已显式降级为组合经理分数加权；"
+                f"请优先修复行情/市值数据源后再用于真实调仓研究：{type(exc).__name__}: {exc}"
+            )
+            target_weights = _build_target_weights(selected, constraints.max_single_asset_weight)
+            black_litterman_summary = {
+                "attempted": True,
+                "status": "failed",
+                "error": f"{type(exc).__name__}: {exc}",
+            }
         actual_weights = current_weights or PositionMemory().load_weights() or _sample_current_weights(target_weights)
         drift_alerts, trade_orders = _build_rebalance_plan(
             actual_weights,
@@ -119,6 +152,9 @@ class ChinaInvestmentAssistant:
             risk_gate=risk_gate,
             research_report_html=report_html,
             warnings=warnings,
+            portfolio_engine=portfolio_engine,
+            portfolio_diagnostics=list(black_litterman_summary.get("diagnostics") or []),
+            black_litterman_summary=black_litterman_summary,
         )
         self.save_result(result)
         append_rebalance_analysis_events(
@@ -141,6 +177,9 @@ class ChinaInvestmentAssistant:
             return None
         payload = json.loads(path.read_text(encoding="utf-8"))
         payload.setdefault("risk_gate", None)
+        payload.setdefault("portfolio_engine", "legacy_unknown")
+        payload.setdefault("portfolio_diagnostics", [])
+        payload.setdefault("black_litterman_summary", {})
         return ChinaInvestmentResult(**payload)
 
     async def _score_universe(self, universe: list[StockCandidate], warnings: list[str]) -> pd.DataFrame:
@@ -257,6 +296,90 @@ def run_china_investment_assistant(
             drift_threshold=drift_threshold,
         )
     )
+
+
+async def _build_black_litterman_target_weights(
+    selected: pd.DataFrame,
+    constraints: ClientPortfolioConstraints,
+    warnings: list[str],
+) -> tuple[dict[str, float], dict[str, Any]]:
+    tickers = [str(ticker).upper() for ticker in selected["ticker"].tolist()]
+    if len(tickers) < 2:
+        raise ValueError("Black-Litterman组合优化至少需要2只股票")
+
+    prior = await build_market_equilibrium_prior_async(tickers, market="cn", years=5)
+    llm_views = _build_manager_views_from_selected(selected)
+    views = build_absolute_views_from_llm(llm_views, tickers, min_confidence=0.05)
+    bl_model = build_black_litterman_model_with_idzorek(
+        views,
+        prior.covariance_matrix,
+        prior.implied_prior_returns,
+        risk_aversion=prior.risk_aversion,
+    )
+    posterior_returns = bl_model.bl_returns()
+    posterior_covariance = bl_model.bl_cov()
+    optimized = optimize_bl_portfolio_weights(
+        posterior_returns,
+        posterior_covariance,
+        constraints=constraints,
+    )
+
+    weights = optimized.weights.astype("float64")
+    if weights.sum() <= 0:
+        raise ValueError("Black-Litterman优化返回空权重")
+    weights = weights / weights.sum()
+    target_weights = {str(ticker): float(weight) for ticker, weight in weights.items() if float(weight) > 1e-4}
+    if len(target_weights) < 2:
+        warnings.append("Black-Litterman结果过度集中，已保留优化结果但建议人工复核单票集中风险。")
+
+    summary = {
+        "attempted": True,
+        "status": "success",
+        "engine": "market_prior+views+optimizer",
+        "tickers": tickers,
+        "view_tickers": views.view_tickers,
+        "view_confidences": views.confidences,
+        "view_expected_excess_returns": {
+            str(index): float(value) for index, value in views.views_vector.items()
+        },
+        "market_weights": {str(ticker): float(value) for ticker, value in prior.market_weights.items()},
+        "implied_prior_returns": {
+            str(ticker): float(value) for ticker, value in prior.implied_prior_returns.items()
+        },
+        "posterior_returns": {str(ticker): float(value) for ticker, value in posterior_returns.items()},
+        "objective": optimized.objective,
+        "expected_return": optimized.expected_return,
+        "volatility": optimized.volatility,
+        "sharpe_ratio": optimized.sharpe_ratio,
+        "fallback_used": optimized.fallback_used,
+        "diagnostics": optimized.diagnostics or [],
+    }
+    return target_weights, summary
+
+
+def _build_manager_views_from_selected(selected: pd.DataFrame) -> dict[str, dict[str, float]]:
+    score = pd.to_numeric(selected["score"], errors="coerce").fillna(0.0)
+    momentum = pd.to_numeric(selected["momentum_60d"], errors="coerce").fillna(0.0)
+    volatility = pd.to_numeric(selected["volatility"], errors="coerce").fillna(0.25).clip(lower=0.05)
+    rsi = pd.to_numeric(selected["rsi_14"], errors="coerce").fillna(50.0)
+
+    centered_score = score - float(score.median())
+    score_scale = float(centered_score.abs().max()) or 1.0
+    momentum_component = momentum.clip(-0.3, 0.3) * 0.12
+    score_component = (centered_score / score_scale).clip(-1.0, 1.0) * 0.045
+    volatility_penalty = (volatility - float(volatility.median())).clip(lower=0.0) * 0.08
+    rsi_penalty = ((rsi - 70.0).clip(lower=0.0) / 100.0) * 0.08
+    expected = (0.035 + momentum_component + score_component - volatility_penalty - rsi_penalty).clip(-0.08, 0.12)
+
+    confidence = (0.45 + score.abs().rank(pct=True) * 0.25 + momentum.abs().rank(pct=True) * 0.15).clip(0.2, 0.85)
+    views: dict[str, dict[str, float]] = {}
+    for idx, row in selected.reset_index(drop=True).iterrows():
+        ticker = str(row["ticker"]).upper()
+        views[ticker] = {
+            "expected_excess_return": float(expected.iloc[idx]),
+            "confidence": float(confidence.iloc[idx]),
+        }
+    return views
 
 
 def _build_target_weights(selected: pd.DataFrame, max_single_weight: float) -> dict[str, float]:

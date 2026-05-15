@@ -1644,6 +1644,15 @@ def _allocation_digest(portfolio_payload: dict[str, Any], artifacts: list[dict[s
         f"- {ticker}: 当前 {float(current_weights.get(ticker, 0.0) or 0.0):.1%} -> 目标 {float(weight):.1%}"
         for ticker, weight in top_weights
     ]
+    engine = str(portfolio_payload.get("portfolio_engine") or "unknown")
+    bl_summary = portfolio_payload.get("black_litterman_summary") or {}
+    if engine == "black_litterman":
+        engine_text = "组合经理Agent：已调用完整 Black-Litterman 链路 market_prior.py -> views.py -> optimizer.py。"
+    else:
+        engine_text = f"组合经理Agent：Black-Litterman链路未完成，本轮使用 {engine}，该结果只能作为降级研究记录。"
+    diagnostics = portfolio_payload.get("portfolio_diagnostics") or bl_summary.get("diagnostics") or []
+    diagnostics_text = "\n".join(f"- {item}" for item in diagnostics[:4])
+
     if trade_orders:
         order_lines = []
         for order in trade_orders[:8]:
@@ -1659,8 +1668,10 @@ def _allocation_digest(portfolio_payload: dict[str, Any], artifacts: list[dict[s
 
     paths = [str(item.get("path")) for item in artifacts if item.get("path")]
     path_text = "\n".join(f"- {path}" for path in paths[-5:])
+    engine_prefix = engine_text + (f"\n优化诊断：\n{diagnostics_text}" if diagnostics_text else "") + "\n\n"
     return (
-        "目标仓位如下：\n"
+        engine_prefix
+        + "目标仓位如下：\n"
         + "\n".join(weight_lines)
         + "\n\n"
         + rebalance_text
