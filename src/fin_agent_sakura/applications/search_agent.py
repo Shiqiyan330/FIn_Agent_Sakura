@@ -17,7 +17,7 @@ from fin_agent_sakura.config import get_llm_config, load_dotenv
 from fin_agent_sakura.storage import SQLiteStore, record_llm_usage
 
 
-SearchProvider = Literal["jina", "serper", "fallback"]
+SearchProvider = Literal["bocha", "jina", "serper", "fallback"]
 DEFAULT_SEARCH_AGENT_OUTPUT = Path("data/processed/search_agent_latest.json")
 
 
@@ -96,10 +96,17 @@ def run_search_agent(
     raw: dict[str, Any] = {}
 
     try:
-        sources, raw = _search_with_serper(resolved_query, max_results=max_results)
-        provider = "serper"
+        sources, raw = _search_with_bocha(resolved_query, max_results=max_results)
+        provider = "bocha"
     except Exception as exc:
-        warnings.append(f"Serper搜索不可用，尝试Jina搜索：{type(exc).__name__}: {exc}")
+        warnings.append(f"Bocha搜索不可用，尝试Serper搜索：{type(exc).__name__}: {exc}")
+
+    if not sources:
+        try:
+            sources, raw = _search_with_serper(resolved_query, max_results=max_results)
+            provider = "serper"
+        except Exception as exc:
+            warnings.append(f"Serper搜索不可用，尝试Jina搜索：{type(exc).__name__}: {exc}")
 
     if not sources:
         try:
@@ -113,7 +120,7 @@ def run_search_agent(
             SearchSource(
                 title="未获得外部搜索结果",
                 url="",
-                snippet="请配置 SERPER_KEY_ID 或检查 Jina Reader/Search 网络访问。",
+                snippet="请配置 BOCHA_API_KEY/SERPER_KEY_ID，或检查 Jina Reader/Search 网络访问。",
                 provider="fallback",
             )
         ]
@@ -144,6 +151,62 @@ def load_latest_search_agent_result(
     if not result_path.exists():
         return None
     return SearchAgentResult.from_dict(json.loads(result_path.read_text(encoding="utf-8")))
+
+
+def _search_with_bocha(query: str, *, max_results: int) -> tuple[list[SearchSource], dict[str, Any]]:
+    load_dotenv()
+    api_key = os.getenv("BOCHA_API_KEY")
+    if not api_key:
+        raise RuntimeError("BOCHA_API_KEY is not configured")
+    response = requests.post(
+        "https://api.bocha.cn/v1/web-search",
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        json={
+            "query": query,
+            "summary": True,
+            "freshness": os.getenv("BOCHA_FRESHNESS", "noLimit"),
+            "count": max_results,
+        },
+        timeout=30,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    items = _extract_bocha_items(payload)
+    sources: list[SearchSource] = []
+    for item in items[:max_results]:
+        title = str(item.get("name") or item.get("title") or item.get("siteName") or "")
+        url = str(item.get("url") or item.get("link") or "")
+        snippet = str(
+            item.get("summary")
+            or item.get("snippet")
+            or item.get("description")
+            or item.get("content")
+            or ""
+        )
+        if not title and not url:
+            continue
+        sources.append(SearchSource(title=title or url, url=url, snippet=snippet, provider="bocha"))
+    if not sources:
+        raise RuntimeError("Bocha returned no searchable web results")
+    return sources, payload
+
+
+def _extract_bocha_items(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    data = payload.get("data")
+    data_dict = data if isinstance(data, dict) else {}
+    web_pages = data_dict.get("webPages")
+    web_pages_dict = web_pages if isinstance(web_pages, dict) else {}
+    candidates: list[Any] = [
+        payload.get("results"),
+        payload.get("items"),
+        data_dict.get("results"),
+        data_dict.get("items"),
+        web_pages_dict.get("value"),
+    ]
+    for candidate in candidates:
+        if isinstance(candidate, list):
+            return [item for item in candidate if isinstance(item, dict)]
+    return []
 
 
 def _search_with_serper(query: str, *, max_results: int) -> tuple[list[SearchSource], dict[str, Any]]:
