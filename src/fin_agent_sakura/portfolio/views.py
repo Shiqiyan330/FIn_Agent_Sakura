@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
 
 import pandas as pd
@@ -17,6 +17,7 @@ class BlackLittermanViews:
     picking_matrix: pd.DataFrame
     views_vector: pd.Series
     confidences: list[float]
+    view_sources: list[str] = field(default_factory=list)
 
 
 def build_absolute_views_from_llm(
@@ -85,6 +86,7 @@ def build_absolute_views_from_llm(
         picking_matrix=picking_matrix,
         views_vector=views_vector,
         confidences=confidences,
+        view_sources=["LLM融合"] * len(confidences),
     )
 
 
@@ -167,4 +169,3 @@ def _normalize_tickers(tickers: Sequence[str]) -> list[str]:
         seen.add(ticker)
         unique.append(ticker)
     return unique
-

@@ -58,6 +58,11 @@ class TechnicalIndicators:
 
         close = pd.to_numeric(working["close"], errors="coerce")
         indicators = self._calculate_with_selected_engine(close)
+        indicators = pd.concat(
+            [indicators, self._calculate_volume_indicators(working)],
+            axis=1,
+            copy=False,
+        )
 
         result = pd.concat([working.reset_index(drop=True), indicators.reset_index(drop=True)], axis=1)
         return result
@@ -186,6 +191,25 @@ class TechnicalIndicators:
                 indicators[column] = pd.NA
         return indicators[expected_columns]
 
+    def _calculate_volume_indicators(self, frame: pd.DataFrame) -> pd.DataFrame:
+        indicators = pd.DataFrame(index=frame.index)
+        if "volume" not in frame.columns:
+            indicators["volume_ma_5"] = pd.NA
+            indicators["volume_ma_20"] = pd.NA
+            indicators["volume_ratio"] = pd.NA
+            indicators["volume_signal"] = "unavailable"
+            return indicators
+
+        volume = pd.to_numeric(frame["volume"], errors="coerce")
+        indicators["volume_ma_5"] = volume.rolling(window=5, min_periods=5).mean()
+        indicators["volume_ma_20"] = volume.rolling(window=20, min_periods=20).mean()
+        indicators["volume_ratio"] = volume / indicators["volume_ma_20"]
+        indicators["volume_signal"] = "normal"
+        indicators.loc[indicators["volume_ratio"] >= 1.5, "volume_signal"] = "expanding"
+        indicators.loc[indicators["volume_ratio"] <= 0.67, "volume_signal"] = "contracting"
+        indicators.loc[indicators["volume_ratio"].isna(), "volume_signal"] = "unavailable"
+        return indicators
+
     def _validate_input(self, ohlcv: pd.DataFrame) -> None:
         missing = self.REQUIRED_COLUMNS.difference(ohlcv.columns)
         if missing:
@@ -210,4 +234,3 @@ class TechnicalIndicators:
             if str(column).startswith(prefix):
                 return frame[column]
         raise TechnicalIndicatorError(f"Indicator output missing column prefix: {prefix}")
-

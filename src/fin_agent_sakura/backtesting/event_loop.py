@@ -18,6 +18,7 @@ class BacktestConfig:
     initial_cash: float = 1_000_000.0
     rebalance_frequency_days: int = 21
     transaction_cost_bps: float = 5.0
+    slippage_bps: float = 0.0
     risk_free_rate: float = 0.02
 
 
@@ -131,7 +132,7 @@ async def run_event_driven_backtest(
             decision = await _maybe_await(strategy(event))
             target_weights = _normalize_target_weights(decision.target_weights, tickers)
             turnover = float((target_weights - weights).abs().sum())
-            transaction_cost = portfolio_value * turnover * cfg.transaction_cost_bps / 10_000
+            transaction_cost = portfolio_value * turnover * (cfg.transaction_cost_bps + cfg.slippage_bps) / 10_000
             portfolio_value -= transaction_cost
             weights = target_weights
 
@@ -222,4 +223,3 @@ def _max_drawdown(equity_curve: pd.Series) -> float:
     running_peak = equity_curve.cummax()
     drawdown = equity_curve / running_peak - 1
     return float(abs(drawdown.min()))
-

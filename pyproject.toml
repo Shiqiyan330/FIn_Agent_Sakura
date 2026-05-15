@@ -55,6 +55,7 @@ portfolio = [
 ]
 dashboard = [
     "plotly>=5.0",
+    "reportlab>=4.0",
     "streamlit>=1.30",
 ]
 

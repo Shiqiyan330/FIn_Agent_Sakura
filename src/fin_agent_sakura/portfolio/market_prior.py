@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from typing import Literal, Sequence
 
 import pandas as pd
 
+from fin_agent_sakura.config import get_tushare_config
 from fin_agent_sakura.data import MarketDataClientFactory
+from fin_agent_sakura.storage import CacheStore
 
 
 MarketName = Literal["us", "cn"]
@@ -36,6 +38,7 @@ async def build_market_equilibrium_prior_async(
     years: int = 5,
     risk_aversion: float = 2.5,
     risk_free_rate: float = 0.02,
+    end_date: str | date | datetime | None = None,
 ) -> MarketPriorResult:
     """Build Black-Litterman market-equilibrium prior returns.
 
@@ -60,7 +63,7 @@ async def build_market_equilibrium_prior_async(
     if risk_aversion <= 0:
         raise ValueError("risk_aversion must be positive")
 
-    end = date.today()
+    end = _coerce_date(end_date) or date.today()
     start = end - timedelta(days=365 * years + 7)
     client = MarketDataClientFactory.get_client(market)
 
@@ -72,7 +75,7 @@ async def build_market_equilibrium_prior_async(
     )
     prices = _build_price_matrix(clean_tickers, ohlcv_frames)
     covariance_matrix = _sample_covariance(prices)
-    market_caps = await _fetch_market_caps(clean_tickers, market)
+    market_caps = await _fetch_market_caps(clean_tickers, market, end_date=end)
     market_weights = market_caps / market_caps.sum()
     implied_prior_returns = _market_implied_prior_returns(
         market_caps=market_caps,
@@ -100,6 +103,7 @@ def build_market_equilibrium_prior(
     years: int = 5,
     risk_aversion: float = 2.5,
     risk_free_rate: float = 0.02,
+    end_date: str | date | datetime | None = None,
 ) -> MarketPriorResult:
     """Synchronous wrapper for build_market_equilibrium_prior_async."""
 
@@ -113,6 +117,7 @@ def build_market_equilibrium_prior(
                 years=years,
                 risk_aversion=risk_aversion,
                 risk_free_rate=risk_free_rate,
+                end_date=end_date,
             )
         )
     raise RuntimeError(
@@ -177,12 +182,24 @@ def _market_implied_prior_returns(
     return prior.reindex(covariance_matrix.index)
 
 
-async def _fetch_market_caps(tickers: Sequence[str], market: MarketName) -> pd.Series:
-    if market != "us":
-        raise NotImplementedError(
-            "Market-cap retrieval is currently implemented for US tickers. "
-            "Add an AkShare/TuShare market-cap adapter before using market='cn'."
+async def _fetch_market_caps(
+    tickers: Sequence[str],
+    market: MarketName,
+    *,
+    end_date: date,
+) -> pd.Series:
+    if market == "cn":
+        market_caps = await asyncio.gather(
+            *[asyncio.to_thread(_fetch_tushare_market_cap, ticker, end_date) for ticker in tickers]
         )
+        series = pd.Series(market_caps, index=list(tickers), dtype="float64")
+        if series.isna().any() or (series <= 0).any():
+            bad = ", ".join(series[series.isna() | (series <= 0)].index)
+            raise ValueError(f"Missing or invalid A-share market cap for: {bad}")
+        return series
+
+    if market != "us":
+        raise ValueError(f"Unsupported market: {market}")
 
     market_caps = await asyncio.gather(*[asyncio.to_thread(_fetch_yfinance_market_cap, t) for t in tickers])
     series = pd.Series(market_caps, index=list(tickers), dtype="float64")
@@ -190,6 +207,49 @@ async def _fetch_market_caps(tickers: Sequence[str], market: MarketName) -> pd.S
         bad = ", ".join(series[series.isna() | (series <= 0)].index)
         raise ValueError(f"Missing or invalid market cap for: {bad}")
     return series
+
+
+def _fetch_tushare_market_cap(ticker: str, end_date: date) -> float:
+    try:
+        import tushare as ts
+    except ImportError as exc:
+        raise RuntimeError("Install tushare with `pip install -e .[market-data-cn]`.") from exc
+
+    cfg = get_tushare_config()
+    if not cfg.token:
+        raise RuntimeError("TUSHARE_TOKEN is required to fetch A-share market caps.")
+
+    cache = CacheStore()
+    cache_key = f"daily_basic_market_cap_{_to_tushare_code(ticker)}_{end_date.strftime('%Y%m%d')}"
+    cached = cache.get_json(cache_key, ttl_seconds=24 * 60 * 60)
+    if cached is not None and cached.get("market_cap"):
+        return float(cached["market_cap"])
+
+    pro = ts.pro_api(cfg.token)
+    pro._DataApi__token = cfg.token
+    if cfg.http_url:
+        pro._DataApi__http_url = cfg.http_url
+
+    lookup_end = end_date.strftime("%Y%m%d")
+    lookup_start = (end_date - timedelta(days=45)).strftime("%Y%m%d")
+    frame = pro.daily_basic(
+        ts_code=_to_tushare_code(ticker),
+        start_date=lookup_start,
+        end_date=lookup_end,
+        fields="ts_code,trade_date,total_mv,circ_mv",
+    )
+    if frame.empty:
+        raise ValueError(f"TuShare daily_basic returned no market-cap rows for {ticker}")
+    frame = frame.sort_values("trade_date", ascending=False)
+    row = frame.iloc[0]
+    market_cap = row.get("total_mv")
+    if pd.isna(market_cap) or float(market_cap) <= 0:
+        market_cap = row.get("circ_mv")
+    if pd.isna(market_cap) or float(market_cap) <= 0:
+        raise ValueError(f"TuShare daily_basic returned invalid market cap for {ticker}")
+    value = float(market_cap)
+    cache.set_json(cache_key, {"ticker": ticker, "end_date": end_date.isoformat(), "market_cap": value})
+    return value
 
 
 def _fetch_yfinance_market_cap(ticker: str) -> float:
@@ -229,3 +289,26 @@ def _normalize_tickers(tickers: Sequence[str]) -> list[str]:
         raise ValueError("At least two unique tickers are required to estimate covariance")
     return unique
 
+
+def _to_tushare_code(symbol: str) -> str:
+    cleaned = symbol.strip().upper()
+    if "." in cleaned:
+        code, exchange = cleaned.split(".", maxsplit=1)
+        return f"{code}.{exchange}"
+    if cleaned.startswith(("SH", "SZ", "BJ")):
+        return f"{cleaned[2:]}.{cleaned[:2]}"
+    if cleaned.startswith(("6", "9")):
+        return f"{cleaned}.SH"
+    if cleaned.startswith(("4", "8")):
+        return f"{cleaned}.BJ"
+    return f"{cleaned}.SZ"
+
+
+def _coerce_date(value: str | date | datetime | None) -> date | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    return datetime.fromisoformat(value).date()

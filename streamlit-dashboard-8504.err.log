@@ -1,0 +1,2 @@
+2026-05-15 06:04:37.961 "general.email" is not a valid config option. If you previously had this config option set, it may have been removed.
+2026-05-15 06:04:38.294 Uvicorn server started on localhost:8504

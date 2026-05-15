@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Literal
 
 import pandas as pd
@@ -32,6 +32,8 @@ class PortfolioOptimizationResult:
     sharpe_ratio: float
     objective: OptimizationObjective
     constraints: ClientPortfolioConstraints
+    fallback_used: bool = False
+    diagnostics: list[str] | None = None
 
     @property
     def weights_percent(self) -> pd.Series:
@@ -74,10 +76,19 @@ def optimize_bl_portfolio_weights(
         posterior_returns,
         posterior_covariance,
     )
+    client_constraints = _make_constraints_feasible(client_constraints, asset_count=len(aligned_returns))
     chosen_objective = objective or _choose_objective(client_constraints)
 
     ef = _build_efficient_frontier(aligned_returns, aligned_covariance, client_constraints)
-    _solve_frontier(ef, chosen_objective, client_constraints)
+    diagnostics = _constraint_diagnostics(aligned_returns, aligned_covariance, client_constraints)
+    fallback_used = False
+    try:
+        _solve_frontier(ef, chosen_objective, client_constraints)
+    except Exception as exc:
+        fallback_used = True
+        diagnostics.append(f"优化目标 {chosen_objective} 不可达，已回退到最小波动组合：{type(exc).__name__}: {exc}")
+        ef = _build_efficient_frontier(aligned_returns, aligned_covariance, client_constraints)
+        ef.min_volatility()
 
     weights = pd.Series(ef.clean_weights(cutoff=clean_cutoff), dtype="float64")
     weights = weights.reindex(aligned_returns.index).fillna(0.0)
@@ -92,6 +103,8 @@ def optimize_bl_portfolio_weights(
         sharpe_ratio=float(sharpe_ratio),
         objective=chosen_objective,
         constraints=client_constraints,
+        fallback_used=fallback_used,
+        diagnostics=diagnostics,
     )
 
 
@@ -151,19 +164,29 @@ def _solve_frontier(
     if objective == "target_volatility":
         if constraints.max_volatility is None:
             raise ValueError("max_volatility is required for target_volatility objective")
-        efficient_frontier.efficient_risk(
-            target_volatility=constraints.max_volatility,
-            market_neutral=False,
-        )
+        try:
+            efficient_frontier.efficient_risk(
+                target_volatility=constraints.max_volatility,
+                market_neutral=False,
+            )
+        except ValueError as exc:
+            if "minimum volatility" not in str(exc).lower():
+                raise
+            efficient_frontier.min_volatility()
         return
 
     if objective == "target_return":
         if constraints.min_expected_return is None:
             raise ValueError("min_expected_return is required for target_return objective")
-        efficient_frontier.efficient_return(
-            target_return=constraints.min_expected_return,
-            market_neutral=False,
-        )
+        try:
+            efficient_frontier.efficient_return(
+                target_return=constraints.min_expected_return,
+                market_neutral=False,
+            )
+        except ValueError as exc:
+            if "minimum volatility" not in str(exc).lower() and "return" not in str(exc).lower():
+                raise
+            efficient_frontier.max_sharpe(risk_free_rate=constraints.risk_free_rate)
         return
 
     if objective == "min_volatility":
@@ -214,3 +237,42 @@ def _validate_inputs(
         raise ValueError("single-asset weight bounds must satisfy 0 <= min <= max <= 1")
     if constraints.risk_free_rate < 0:
         raise ValueError("risk_free_rate must be non-negative")
+
+
+def _make_constraints_feasible(
+    constraints: ClientPortfolioConstraints,
+    *,
+    asset_count: int,
+) -> ClientPortfolioConstraints:
+    if asset_count <= 0:
+        raise ValueError("asset_count must be positive")
+    minimum_required_max_weight = 1 / asset_count
+    if constraints.max_single_asset_weight >= minimum_required_max_weight:
+        return constraints
+    return replace(
+        constraints,
+        max_single_asset_weight=minimum_required_max_weight,
+    )
+
+
+def _constraint_diagnostics(
+    posterior_returns: pd.Series,
+    posterior_covariance: pd.DataFrame,
+    constraints: ClientPortfolioConstraints,
+) -> list[str]:
+    diagnostics: list[str] = []
+    if constraints.min_expected_return is not None:
+        max_asset_return = float(posterior_returns.max())
+        if constraints.min_expected_return > max_asset_return:
+            diagnostics.append(
+                f"最低预期收益 {constraints.min_expected_return:.2%} 高于单资产最高后验收益 {max_asset_return:.2%}，可能不可达。"
+            )
+    if constraints.max_volatility is not None:
+        min_variance_proxy = float(posterior_covariance.values.diagonal().min() ** 0.5)
+        if constraints.max_volatility < min_variance_proxy * 0.5:
+            diagnostics.append(
+                f"目标波动率 {constraints.max_volatility:.2%} 可能过低，低于可观察单资产波动率下界的一半。"
+            )
+    if constraints.max_single_asset_weight < 1 / max(1, len(posterior_returns)):
+        diagnostics.append("单只股票上限低于等权配置所需权重，系统会自动放宽到可行下限。")
+    return diagnostics

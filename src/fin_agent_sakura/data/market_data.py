@@ -22,6 +22,9 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
+from fin_agent_sakura.config import load_dotenv
+from fin_agent_sakura.storage import CacheStore
+
 if TYPE_CHECKING:
     import pandas as pd
 
@@ -181,6 +184,7 @@ class USMarketDataClient(MarketDataClient):
     ) -> None:
         if getattr(self, "_initialized", False):
             return
+        load_dotenv()
         super().__init__(retry_config=retry_config)
         self.fmp_api_key = fmp_api_key or os.getenv("FMP_API_KEY")
 
@@ -353,16 +357,25 @@ class CNMarketDataClient(MarketDataClient):
         "cash_flow": "现金流量表",
         "income_statement": "利润表",
     }
+    _OHLCV_CACHE_TTL_SECONDS: ClassVar[int] = 24 * 60 * 60
 
     def __init__(
         self,
         tushare_token: str | None = None,
+        tushare_http_url: str | None = None,
         retry_config: RetryConfig | None = None,
     ) -> None:
         if getattr(self, "_initialized", False):
+            if tushare_token:
+                self.tushare_token = tushare_token
+            if tushare_http_url:
+                self.tushare_http_url = tushare_http_url
             return
+        load_dotenv()
         super().__init__(retry_config=retry_config)
         self.tushare_token = tushare_token or os.getenv("TUSHARE_TOKEN")
+        self.tushare_http_url = tushare_http_url or os.getenv("TUSHARE_HTTP_URL")
+        self.cache = CacheStore()
 
     async def fetch_ohlcv(
         self,
@@ -372,15 +385,35 @@ class CNMarketDataClient(MarketDataClient):
         interval: OHLCVInterval = "1d",
         adjusted: bool = True,
     ) -> "pd.DataFrame":
-        return await self._with_retry(
-            f"AkShare OHLCV fetch for {symbol}",
-            self._fetch_akshare_ohlcv,
-            symbol,
-            start,
-            end,
-            interval,
-            adjusted,
-        )
+        if self.tushare_token and interval == "1d":
+            return await self._with_retry(
+                f"TuShare daily OHLCV fetch for {symbol}",
+                self._fetch_tushare_ohlcv,
+                symbol,
+                start,
+                end,
+            )
+
+        try:
+            return await self._with_retry(
+                f"AkShare OHLCV fetch for {symbol}",
+                self._fetch_akshare_ohlcv,
+                symbol,
+                start,
+                end,
+                interval,
+                adjusted,
+            )
+        except Exception:
+            if not self.tushare_token or interval != "1d":
+                raise
+            return await self._with_retry(
+                f"TuShare daily OHLCV fallback fetch for {symbol}",
+                self._fetch_tushare_ohlcv,
+                symbol,
+                start,
+                end,
+            )
 
     async def fetch_balance_sheet(
         self,
@@ -464,6 +497,39 @@ class CNMarketDataClient(MarketDataClient):
         )
         return _normalize_ohlcv_frame(renamed, symbol=symbol)
 
+    def _fetch_tushare_ohlcv(
+        self,
+        symbol: str,
+        start: DateLike,
+        end: DateLike,
+    ) -> "pd.DataFrame":
+        cache_key = (
+            f"ohlcv_tushare_{_to_tushare_code(symbol)}_"
+            f"{_format_date(start, '%Y%m%d') or '19900101'}_"
+            f"{_format_date(end, '%Y%m%d') or datetime.now().strftime('%Y%m%d')}"
+        )
+        cached = self.cache.get_dataframe(cache_key, ttl_seconds=self._OHLCV_CACHE_TTL_SECONDS)
+        if cached is not None:
+            return cached
+
+        pro = self._tushare_pro()
+        frame = pro.daily(
+            ts_code=_to_tushare_code(symbol),
+            start_date=_format_date(start, "%Y%m%d") or "19900101",
+            end_date=_format_date(end, "%Y%m%d") or datetime.now().strftime("%Y%m%d"),
+        )
+        renamed = frame.rename(
+            columns={
+                "trade_date": "date",
+                "vol": "volume",
+            }
+        )
+        if "date" in renamed.columns:
+            renamed = renamed.sort_values("date")
+        normalized = _normalize_ohlcv_frame(renamed, symbol=symbol)
+        self.cache.set_dataframe(cache_key, normalized)
+        return normalized
+
     def _fetch_tushare_statement(
         self,
         symbol: str,
@@ -471,11 +537,7 @@ class CNMarketDataClient(MarketDataClient):
         period: FinancialPeriod,
         limit: int,
     ) -> "pd.DataFrame":
-        ts = _import_tushare()
-        if not self.tushare_token:
-            raise ConfigurationError("TUSHARE_TOKEN is required for TuShare")
-
-        pro = ts.pro_api(self.tushare_token)
+        pro = self._tushare_pro()
         ts_code = _to_tushare_code(symbol)
         endpoint_by_statement: dict[StatementKind, str] = {
             "balance_sheet": "balancesheet",
@@ -492,6 +554,17 @@ class CNMarketDataClient(MarketDataClient):
         if frame.empty:
             raise DataProviderError(f"TuShare returned no {statement_kind} rows for {symbol}")
         return frame
+
+    def _tushare_pro(self) -> Any:
+        ts = _import_tushare()
+        if not self.tushare_token:
+            raise ConfigurationError("TUSHARE_TOKEN is required for TuShare")
+
+        pro = ts.pro_api(self.tushare_token)
+        pro._DataApi__token = self.tushare_token
+        if self.tushare_http_url:
+            pro._DataApi__http_url = self.tushare_http_url
+        return pro
 
     def _fetch_akshare_statement(
         self,
@@ -524,13 +597,18 @@ class MarketDataClientFactory:
         *,
         fmp_api_key: str | None = None,
         tushare_token: str | None = None,
+        tushare_http_url: str | None = None,
         retry_config: RetryConfig | None = None,
     ) -> MarketDataClient:
         market_value = Market(str(market).lower())
         if market_value is Market.US:
             return USMarketDataClient(fmp_api_key=fmp_api_key, retry_config=retry_config)
         if market_value is Market.CN:
-            return CNMarketDataClient(tushare_token=tushare_token, retry_config=retry_config)
+            return CNMarketDataClient(
+                tushare_token=tushare_token,
+                tushare_http_url=tushare_http_url,
+                retry_config=retry_config,
+            )
         raise ValueError(f"Unsupported market: {market}")
 
 

@@ -9,6 +9,8 @@ from hashlib import sha1
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
+from fin_agent_sakura.config import get_llm_config
+
 
 class FinancialRAGError(RuntimeError):
     """Raised when the financial document retrieval pipeline fails."""
@@ -28,6 +30,26 @@ class FinancialRAGConfig:
     bm25_k: int = 8
     final_k: int = 5
     rrf_k: int = 60
+
+
+@dataclass(frozen=True, slots=True)
+class FinancialContextMatch:
+    """One hybrid retrieval match with source metadata and normalized score."""
+
+    context: str
+    score: float
+    source: str
+    page: str
+    chunk_id: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "context": self.context,
+            "score": self.score,
+            "source": self.source,
+            "page": self.page,
+            "chunk_id": self.chunk_id,
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,6 +103,17 @@ class FinancialDocumentPipeline:
     def retrieve(self, query: str, ticker: str, *, top_k: int | None = None) -> list[str]:
         """Return the most relevant paragraphs for a ticker and query."""
 
+        return [match.context for match in self.retrieve_with_scores(query, ticker, top_k=top_k)]
+
+    def retrieve_with_scores(
+        self,
+        query: str,
+        ticker: str,
+        *,
+        top_k: int | None = None,
+    ) -> list[FinancialContextMatch]:
+        """Return relevant paragraphs with hybrid RRF scores and source metadata."""
+
         if not query.strip():
             raise FinancialRAGError("query must not be empty")
 
@@ -94,10 +127,47 @@ class FinancialDocumentPipeline:
 
         vector_docs = self._vector_search(query, ticker_key, deps)
         bm25_docs = self._bm25_search(query, stored_docs, deps)
-        fused_docs = self._reciprocal_rank_fusion([vector_docs, bm25_docs])
+        fused_docs = self._reciprocal_rank_fusion_with_scores([vector_docs, bm25_docs])
 
         limit = top_k or self.config.final_k
-        return [_format_context(doc) for doc in fused_docs[:limit]]
+        if not fused_docs:
+            return []
+        max_score = max(score for _, score in fused_docs) or 1.0
+        return [
+            FinancialContextMatch(
+                context=_format_context(doc),
+                score=float(score / max_score),
+                source=Path(str(doc.metadata.get("source", ""))).name,
+                page=str(doc.metadata.get("page", "unknown")),
+                chunk_id=str(doc.metadata.get("chunk_id") or ""),
+            )
+            for doc, score in fused_docs[:limit]
+        ]
+
+    def delete_index(self, ticker: str) -> None:
+        """Delete local chunk store and vector collection for one ticker."""
+
+        deps = _import_langchain_dependencies()
+        ticker_key = _normalize_ticker(ticker)
+        chunk_path = self._chunk_store_path(ticker_key)
+        if chunk_path.exists():
+            chunk_path.unlink()
+
+        runtime_config = get_llm_config()
+        embeddings = deps.openai_embeddings(
+            model=self.config.embedding_model or runtime_config.embedding_model,
+            api_key=runtime_config.api_key,
+            base_url=runtime_config.base_url,
+        )
+        store = deps.chroma(
+            collection_name=self._collection_name(ticker_key),
+            embedding_function=embeddings,
+            persist_directory=str(self._vector_dir()),
+        )
+        try:
+            store.delete_collection()
+        except Exception:
+            pass
 
     def _load_pdf_pages(self, pdf_path: Path, ticker: str, deps: _LangChainDeps) -> list[Any]:
         loader = deps.pdf_loader(str(pdf_path))
@@ -147,7 +217,12 @@ class FinancialDocumentPipeline:
         *,
         overwrite: bool,
     ) -> None:
-        embeddings = deps.openai_embeddings(model=self.config.embedding_model)
+        runtime_config = get_llm_config()
+        embeddings = deps.openai_embeddings(
+            model=self.config.embedding_model or runtime_config.embedding_model,
+            api_key=runtime_config.api_key,
+            base_url=runtime_config.base_url,
+        )
         store = deps.chroma(
             collection_name=self._collection_name(ticker),
             embedding_function=embeddings,
@@ -202,7 +277,12 @@ class FinancialDocumentPipeline:
         return docs
 
     def _vector_search(self, query: str, ticker: str, deps: _LangChainDeps) -> list[Any]:
-        embeddings = deps.openai_embeddings(model=self.config.embedding_model)
+        runtime_config = get_llm_config()
+        embeddings = deps.openai_embeddings(
+            model=self.config.embedding_model or runtime_config.embedding_model,
+            api_key=runtime_config.api_key,
+            base_url=runtime_config.base_url,
+        )
         store = deps.chroma(
             collection_name=self._collection_name(ticker),
             embedding_function=embeddings,
@@ -218,6 +298,9 @@ class FinancialDocumentPipeline:
         return list(retriever.get_relevant_documents(query))
 
     def _reciprocal_rank_fusion(self, ranked_lists: Iterable[Sequence[Any]]) -> list[Any]:
+        return [doc for doc, _ in self._reciprocal_rank_fusion_with_scores(ranked_lists)]
+
+    def _reciprocal_rank_fusion_with_scores(self, ranked_lists: Iterable[Sequence[Any]]) -> list[tuple[Any, float]]:
         scores: dict[str, float] = {}
         docs_by_id: dict[str, Any] = {}
 
@@ -228,8 +311,8 @@ class FinancialDocumentPipeline:
                 docs_by_id[chunk_id] = doc
 
         return [
-            docs_by_id[chunk_id]
-            for chunk_id, _ in sorted(scores.items(), key=lambda item: item[1], reverse=True)
+            (docs_by_id[chunk_id], score)
+            for chunk_id, score in sorted(scores.items(), key=lambda item: item[1], reverse=True)
         ]
 
     def _collection_name(self, ticker: str) -> str:
@@ -267,6 +350,28 @@ def retrieve_financial_context(
     """Retrieve the most relevant annual-report paragraphs for a ticker."""
 
     return FinancialDocumentPipeline(config).retrieve(query, ticker, top_k=top_k)
+
+
+def retrieve_financial_context_with_scores(
+    query: str,
+    ticker: str,
+    *,
+    top_k: int | None = None,
+    config: FinancialRAGConfig | None = None,
+) -> list[FinancialContextMatch]:
+    """Retrieve relevant annual-report paragraphs with similarity scores."""
+
+    return FinancialDocumentPipeline(config).retrieve_with_scores(query, ticker, top_k=top_k)
+
+
+def delete_financial_report_index(
+    ticker: str,
+    *,
+    config: FinancialRAGConfig | None = None,
+) -> None:
+    """Delete all local RAG index artifacts for one ticker."""
+
+    FinancialDocumentPipeline(config).delete_index(ticker)
 
 
 def _import_langchain_dependencies() -> _LangChainDeps:
@@ -340,4 +445,3 @@ def _format_context(doc: Any) -> str:
     if summary:
         prefix = f"{prefix} page_summary={summary}"
     return f"{prefix}\n{doc.page_content}"
-

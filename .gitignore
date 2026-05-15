@@ -5,5 +5,6 @@ __pycache__/
 .ruff_cache/
 .venv/
 venv/
+.env
 data/rag_index/
-
+data/processed/

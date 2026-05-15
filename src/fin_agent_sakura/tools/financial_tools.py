@@ -10,6 +10,7 @@ from typing import Any, Literal
 import pandas as pd
 from langchain_core.tools import tool
 
+from fin_agent_sakura.config import get_llm_config
 from fin_agent_sakura.data import MarketDataClientFactory
 
 
@@ -50,9 +51,12 @@ def create_financial_tool_calling_llm(
     except ImportError as exc:
         raise RuntimeError("Install LLM dependencies with `pip install -e .[tools]`.") from exc
 
+    config = get_llm_config()
     llm = ChatOpenAI(
-        model=model or os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini"),
+        model=model or config.chat_model,
         temperature=temperature,
+        api_key=config.api_key,
+        base_url=config.base_url,
         **kwargs,
     )
     return llm.bind_tools(get_financial_tools())
@@ -118,15 +122,8 @@ def get_recent_news(ticker: str, market: MarketName = "us", limit: int = 5) -> s
     """
 
     _validate_limit(limit)
-    if market != "us":
-        return _to_json(
-            {
-                "ticker": ticker,
-                "market": market,
-                "news": [],
-                "warning": "Recent news retrieval is currently implemented for US tickers only.",
-            }
-        )
+    if market == "cn":
+        return _to_json({"ticker": ticker, "market": market, "news": _fetch_akshare_news(ticker, limit)})
 
     return _to_json({"ticker": ticker, "market": market, "news": _fetch_yfinance_news(ticker, limit)})
 
@@ -165,6 +162,29 @@ def _fetch_yfinance_news(ticker: str, limit: int) -> list[dict[str, Any]]:
     return [_normalize_news_item(ticker, item) for item in raw_items[:limit]]
 
 
+def _fetch_akshare_news(ticker: str, limit: int) -> list[dict[str, Any]]:
+    try:
+        import akshare as ak
+    except ImportError as exc:
+        raise RuntimeError("Install akshare with `pip install -e .[market-data-cn]`.") from exc
+
+    symbol = _to_akshare_symbol(ticker)
+    for fn_name, kwargs in [
+        ("stock_news_em", {"symbol": symbol}),
+        ("stock_news_main_cx", {"symbol": symbol}),
+    ]:
+        fn = getattr(ak, fn_name, None)
+        if fn is None:
+            continue
+        try:
+            frame = fn(**kwargs)
+        except Exception:
+            continue
+        if isinstance(frame, pd.DataFrame) and not frame.empty:
+            return [_normalize_akshare_news_item(ticker, row.to_dict()) for _, row in frame.head(limit).iterrows()]
+    return []
+
+
 def _normalize_news_item(ticker: str, item: dict[str, Any]) -> dict[str, Any]:
     content = item.get("content") if isinstance(item.get("content"), dict) else {}
     return {
@@ -175,6 +195,23 @@ def _normalize_news_item(ticker: str, item: dict[str, Any]) -> dict[str, Any]:
         "published_at": item.get("providerPublishTime") or content.get("pubDate"),
         "summary": item.get("summary") or content.get("summary"),
         "type": item.get("type") or content.get("contentType"),
+    }
+
+
+def _normalize_akshare_news_item(ticker: str, item: dict[str, Any]) -> dict[str, Any]:
+    title = item.get("新闻标题") or item.get("标题") or item.get("title")
+    summary = item.get("新闻内容") or item.get("摘要") or item.get("summary")
+    link = item.get("新闻链接") or item.get("链接") or item.get("url")
+    published_at = item.get("发布时间") or item.get("时间") or item.get("date")
+    publisher = item.get("文章来源") or item.get("来源") or item.get("publisher")
+    return {
+        "ticker": ticker.upper(),
+        "title": title,
+        "publisher": publisher,
+        "link": link,
+        "published_at": published_at,
+        "summary": summary,
+        "type": "cn_stock_news",
     }
 
 
@@ -192,3 +229,12 @@ def _validate_limit(limit: int) -> None:
         raise ValueError("limit must be positive")
     if limit > 20:
         raise ValueError("limit must be 20 or less to keep tool responses concise")
+
+
+def _to_akshare_symbol(symbol: str) -> str:
+    cleaned = symbol.strip().upper()
+    if "." in cleaned:
+        return cleaned.split(".", maxsplit=1)[0]
+    if cleaned.startswith(("SH", "SZ", "BJ")):
+        return cleaned[2:]
+    return cleaned
