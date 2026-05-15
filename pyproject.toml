@@ -25,7 +25,7 @@ market-data = [
     "tushare>=1.4",
 ]
 technical-analysis = [
-    "pandas-ta>=0.3.14b0",
+    "pandas-ta>=0.3.14b0; python_version >= '3.12'",
 ]
 technical-analysis-talib = [
     "TA-Lib>=0.4",
