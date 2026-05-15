@@ -375,6 +375,7 @@ class CNMarketDataClient(MarketDataClient):
         super().__init__(retry_config=retry_config)
         self.tushare_token = tushare_token or os.getenv("TUSHARE_TOKEN")
         self.tushare_http_url = tushare_http_url or os.getenv("TUSHARE_HTTP_URL")
+        self.provider_mode = os.getenv("A_SHARE_DATA_PROVIDER", "tushare").strip().lower()
         self.cache = CacheStore()
 
     async def fetch_ohlcv(
@@ -385,7 +386,11 @@ class CNMarketDataClient(MarketDataClient):
         interval: OHLCVInterval = "1d",
         adjusted: bool = True,
     ) -> "pd.DataFrame":
-        if self.tushare_token and interval == "1d":
+        if self.provider_mode != "akshare":
+            if not self.tushare_token:
+                raise ConfigurationError("TUSHARE_TOKEN is required for A-share OHLCV data.")
+            if interval != "1d":
+                raise ConfigurationError("TuShare OHLCV currently supports only daily interval in this client.")
             return await self._with_retry(
                 f"TuShare daily OHLCV fetch for {symbol}",
                 self._fetch_tushare_ohlcv,
@@ -446,7 +451,9 @@ class CNMarketDataClient(MarketDataClient):
         period: FinancialPeriod,
         limit: int,
     ) -> "pd.DataFrame":
-        if self.tushare_token:
+        if self.provider_mode != "akshare":
+            if not self.tushare_token:
+                raise ConfigurationError(f"TUSHARE_TOKEN is required for A-share {statement_kind} data.")
             return await self._with_retry(
                 f"TuShare {statement_kind} fetch for {symbol}",
                 self._fetch_tushare_statement,

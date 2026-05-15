@@ -187,7 +187,7 @@ def _provider_plan(*, mode: DataSourceMode, tushare_configured: bool) -> list[Li
         return ["tushare"]
     if mode == "akshare":
         return ["akshare"]
-    return ["tushare", "akshare"] if tushare_configured else ["akshare"]
+    return ["tushare"]
 
 
 async def _run_provider_checks(
